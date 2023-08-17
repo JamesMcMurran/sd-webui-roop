@@ -1,194 +1,353 @@
+import copy
+import math
 import os
-import gradio as gr
-import modules.scripts as scripts
-from modules.upscaler import Upscaler, UpscalerData
-from modules import scripts, shared, images, scripts_postprocessing
-from modules.processing import (
-    StableDiffusionProcessing,
-    StableDiffusionProcessingImg2Img,
-)
-from modules.shared import cmd_opts, opts, state
+import tempfile
+from dataclasses import dataclass
+from typing import List, Union, Dict, Set, Tuple
+
+import cv2
+import numpy as np
 from PIL import Image
-import glob
-from modules.face_restoration import FaceRestoration
 
+import insightface
+import onnxruntime
+from scripts.cimage import convert_to_sd
+
+from modules.face_restoration import FaceRestoration, restore_faces
+from modules.upscaler import Upscaler, UpscalerData
 from scripts.roop_logging import logger
-from scripts.swapper import UpscaleOptions, swap_face, ImageResult
-from scripts.roop_version import version_flag
-import os
 
 
-def get_models():
-    models_path = os.path.join(scripts.basedir(), "models" + os.path.sep + "roop" + os.path.sep + "*")
-    models = glob.glob(models_path)
-    models = [x for x in models if x.endswith(".onnx") or x.endswith(".pth")]
-    return models
+# Global cache for source face information
+SOURCE_FACE_CACHE = {}
+providers = ["CPUExecutionProvider"]
 
 
-class FaceSwapScript(scripts.Script):
-    def title(self):
-        return f"roop"
+@dataclass
+class UpscaleOptions:
+    scale: int = 1
+    upscaler: UpscalerData = None
+    upscale_visibility: float = 0.5
+    face_restorer: FaceRestoration = None
+    restorer_visibility: float = 0.5
 
-    def show(self, is_img2img):
-        return scripts.AlwaysVisible
+FS_MODEL = None
+CURRENT_FS_MODEL_PATH = None
 
-    def ui(self, is_img2img):
-        with gr.Accordion(f"roop {version_flag}", open=False):
-            with gr.Column():
-                img = gr.inputs.Image(type="pil")
-                enable = gr.Checkbox(False, placeholder="enable", label="Enable")
-                faces_index = gr.Textbox(
-                    value="0",
-                    placeholder="Which face to swap (comma separated), start from 0",
-                    label="Comma separated face number(s)",
-                )
-                with gr.Row():
-                    face_restorer_name = gr.Radio(
-                        label="Restore Face",
-                        choices=["None"] + [x.name() for x in shared.face_restorers],
-                        value=shared.face_restorers[0].name(),
-                        type="value",
-                    )
-                    face_restorer_visibility = gr.Slider(
-                        0, 1, 1, step=0.1, label="Restore visibility"
-                    )
-                upscaler_name = gr.inputs.Dropdown(
-                    choices=[upscaler.name for upscaler in shared.sd_upscalers],
-                    label="Upscaler",
-                )
-                upscaler_scale = gr.Slider(1, 8, 1, step=0.1, label="Upscaler scale")
-                upscaler_visibility = gr.Slider(
-                    0, 1, 1, step=0.1, label="Upscaler visibility (if scale = 1)"
-                )
+def get_face_single(img_data: np.ndarray, face_index=0, det_size=(640, 640)):
+    face_analyser = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
+    face_analyser.prepare(ctx_id=0, det_size=det_size)
+    face = face_analyser.get(img_data)
 
-                models = get_models()
-                if len(models) == 0:
-                    logger.warning(
-                        "You should at least have one model in models directory, please read the doc here : https://github.com/s0md3v/sd-webui-roop/"
-                    )
-                    model = gr.inputs.Dropdown(
-                        choices=models,
-                        label="Model not found, please download one and reload automatic 1111",
-                    )
-                else:
-                    model = gr.inputs.Dropdown(
-                        choices=models, label="Model", default=models[0]
-                    )
+    if len(face) == 0 and det_size[0] > 320 and det_size[1] > 320:
+        det_size_half = (det_size[0] // 2, det_size[1] // 2)
+        return get_face_single(img_data, face_index=face_index, det_size=det_size_half)
 
-                swap_in_source = gr.Checkbox(
-                    False,
-                    placeholder="Swap face in source image",
-                    label="Swap in source image",
-                    visible=is_img2img,
-                )
-                swap_in_generated = gr.Checkbox(
-                    True,
-                    placeholder="Swap face in generated image",
-                    label="Swap in generated image",
-                    visible=is_img2img,
-                )
-
-        return [
-            img,
-            enable,
-            faces_index,
-            model,
-            face_restorer_name,
-            face_restorer_visibility,
-            upscaler_name,
-            upscaler_scale,
-            upscaler_visibility,
-            swap_in_source,
-            swap_in_generated,
-        ]
-
-    @property
-    def upscaler(self) -> UpscalerData:
-        for upscaler in shared.sd_upscalers:
-            if upscaler.name == self.upscaler_name:
-                return upscaler
+    try:
+        return sorted(face, key=lambda x: x.bbox[0])[face_index]
+    except IndexError:
         return None
 
-    @property
-    def face_restorer(self) -> FaceRestoration:
-        for face_restorer in shared.face_restorers:
-            if face_restorer.name() == self.face_restorer_name:
-                return face_restorer
-        return None
 
-    @property
-    def upscale_options(self) -> UpscaleOptions:
-        return UpscaleOptions(
-            scale=self.upscaler_scale,
-            upscaler=self.upscaler,
-            face_restorer=self.face_restorer,
-            upscale_visibility=self.upscaler_visibility,
-            restorer_visibility=self.face_restorer_visibility,
+def getFaceSwapModel(model_path: str):
+    global FS_MODEL
+    global CURRENT_FS_MODEL_PATH
+    if CURRENT_FS_MODEL_PATH is None or CURRENT_FS_MODEL_PATH != model_path:
+        CURRENT_FS_MODEL_PATH = model_path
+        FS_MODEL = insightface.model_zoo.get_model(model_path, providers=providers)
+
+    return FS_MODEL
+
+
+def upscale_image(image: Image, upscale_options: UpscaleOptions):
+    result_image = image
+    if upscale_options.upscaler is not None and upscale_options.upscaler.name != "None":
+        original_image = result_image.copy()
+        logger.info(
+            "Upscale with %s scale = %s",
+            upscale_options.upscaler.name,
+            upscale_options.scale,
+        )
+        result_image = upscale_options.upscaler.scaler.upscale(
+            image, upscale_options.scale, upscale_options.upscaler.data_path
+        )
+        if upscale_options.scale == 1:
+            result_image = Image.blend(
+                original_image, result_image, upscale_options.upscale_visibility
+            )
+
+    if upscale_options.face_restorer is not None:
+        original_image = result_image.copy()
+        logger.info("Restore face with %s", upscale_options.face_restorer.name())
+        numpy_image = np.array(result_image)
+        numpy_image = upscale_options.face_restorer.restore(numpy_image)
+        restored_image = Image.fromarray(numpy_image)
+        result_image = Image.blend(
+            original_image, restored_image, upscale_options.restorer_visibility
         )
 
-    def process(
-        self,
-        p: StableDiffusionProcessing,
-        img,
-        enable,
-        faces_index,
-        model,
-        face_restorer_name,
-        face_restorer_visibility,
-        upscaler_name,
-        upscaler_scale,
-        upscaler_visibility,
-        swap_in_source,
-        swap_in_generated,
-    ):
-        self.source = img
-        self.face_restorer_name = face_restorer_name
-        self.upscaler_scale = upscaler_scale
-        self.upscaler_visibility = upscaler_visibility
-        self.face_restorer_visibility = face_restorer_visibility
-        self.enable = enable
-        self.upscaler_name = upscaler_name
-        self.swap_in_generated = swap_in_generated
-        self.model = model
-        self.faces_index = {
-            int(x) for x in faces_index.strip(",").split(",") if x.isnumeric()
-        }
-        if len(self.faces_index) == 0:
-            self.faces_index = {0}
-        if self.enable:
-            if self.source is not None:
-                if isinstance(p, StableDiffusionProcessingImg2Img) and swap_in_source:
-                    logger.info(f"roop enabled, face index %s", self.faces_index)
+    return result_image
 
-                    for i in range(len(p.init_images)):
-                        logger.info(f"Swap in source %s", i)
-                        result = swap_face(
-                            self.source,
-                            p.init_images[i],
-                            faces_index=self.faces_index,
-                            model=self.model,
-                            upscale_options=self.upscale_options,
-                        )
-                        p.init_images[i] = result.image()
+
+
+    # Check if the source face is in cache
+    if face_index == 0 and np.array_equal(img_data, SOURCE_IMG_DATA): 
+        return SOURCE_FACE_CACHE
+
+    # If not, extract the face and cache it
+    face_analyser = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
+    face_analyser.prepare(ctx_id=0, det_size=det_size)
+    face = face_analyser.get(img_data)
+
+    if len(face) == 0 and det_size[0] > 320 and det_size[1] > 320:
+        det_size_half = (det_size[0] // 2, det_size[1] // 2)
+        return get_face_single(img_data, face_index=face_index, det_size=det_size_half)
+
+    try:
+        result_face = sorted(face, key=lambda x: x.bbox[0])[face_index]
+        # Cache the source face information if it's the source face
+        if face_index == 0:
+            SOURCE_FACE_CACHE = result_face
+            SOURCE_IMG_DATA = img_data
+        return result_face
+    except IndexError:
+        return None
+
+
+
+@dataclass
+class ImageResult:
+    path: Union[str, None] = None
+    similarity: Union[Dict[int, float], None] = None  # face, 0..1
+
+    def image(self) -> Union[Image.Image, None]:
+        if self.path:
+            return Image.open(self.path)
+        return None
+
+
+def swap_face(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    model: Union[str, None] = None,
+    faces_index: Set[int] = {0},
+    upscale_options: Union[UpscaleOptions, None] = None,
+) -> ImageResult:
+    result_image = target_img
+    converted = convert_to_sd(target_img)
+    scale, fn = converted[0], converted[1]
+    if model is not None and not scale:
+        if isinstance(source_img, str):  # source_img is a base64 string
+            import base64, io
+            if 'base64,' in source_img:  # check if the base64 string has a data URL scheme
+                base64_data = source_img.split('base64,')[-1]
+                img_bytes = base64.b64decode(base64_data)
             else:
-                logger.error(f"Please provide a source face")
+                # if no data URL scheme, just decode
+                img_bytes = base64.b64decode(source_img)
+            source_img = Image.open(io.BytesIO(img_bytes))
+        source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
+        target_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
+        source_face = get_face_single(source_img, face_index=0)
+        if source_face is not None:
+            result = target_img
+            model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), model)
+            face_swapper = getFaceSwapModel(model_path)
 
-    def postprocess_batch(self, *args, **kwargs):
-        if self.enable:
-            return images
+            for face_num in faces_index:
+                target_face = get_face_single(target_img, face_index=face_num)
+                if target_face is not None:
+                    result = face_swapper.get(result, target_face, source_face)
+                else:
+                    logger.info(f"No target face found for {face_num}")
 
-    def postprocess_image(self, p, script_pp: scripts.PostprocessImageArgs, *args):
-        if self.enable and self.swap_in_generated:
-            if self.source is not None:
-                image: Image.Image = script_pp.image
-                result: ImageResult = swap_face(
-                    self.source,
-                    image,
-                    faces_index=self.faces_index,
-                    model=self.model,
-                    upscale_options=self.upscale_options,
-                )
-                pp = scripts_postprocessing.PostprocessedImage(result.image())
-                pp.info = {}
-                p.extra_generation_params.update(pp.info)
-                script_pp.image = pp.image
+            result_image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+            if upscale_options is not None:
+                result_image = upscale_image(result_image, upscale_options)
+        else:
+            logger.info("No source face found")
+    result_image.save(fn.name)
+    return ImageResult(path=fn.name)
+
+
+
+import multiprocessing
+
+def parallel_face_swap(source_img, target_images_list, model=None, faces_index={0}, upscale_options=None):
+    # Wrapper function for swap_face to be used with multiprocessing
+    def worker(target_img):
+        return swap_face(source_img, target_img, model, faces_index, upscale_options)
+    
+    # Using Pool to parallelize the face swapping process
+    with multiprocessing.Pool(multiprocessing.cpu_count()) as pool:
+        results = pool.map(worker, target_images_list)
+    
+    return resultsy
+import math
+import os
+import tempfile
+from dataclasses import dataclass
+from typing import List, Union, Dict, Set, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+
+import insightface
+import onnxruntime
+from scripts.cimage import convert_to_sd
+
+from modules.face_restoration import FaceRestoration, restore_faces
+from modules.upscaler import Upscaler, UpscalerData
+from scripts.roop_logging import logger
+
+
+# Global cache for source face information
+SOURCE_FACE_CACHE = {}
+providers = ["CPUExecutionProvider"]
+
+
+@dataclass
+class UpscaleOptions:
+    scale: int = 1
+    upscaler: UpscalerData = None
+    upscale_visibility: float = 0.5
+    face_restorer: FaceRestoration = None
+    restorer_visibility: float = 0.5
+
+FS_MODEL = None
+CURRENT_FS_MODEL_PATH = None
+
+
+def getFaceSwapModel(model_path: str):
+    global FS_MODEL
+    global CURRENT_FS_MODEL_PATH
+    if CURRENT_FS_MODEL_PATH is None or CURRENT_FS_MODEL_PATH != model_path:
+        CURRENT_FS_MODEL_PATH = model_path
+        FS_MODEL = insightface.model_zoo.get_model(model_path, providers=providers)
+
+    return FS_MODEL
+
+
+def upscale_image(image: Image, upscale_options: UpscaleOptions):
+    result_image = image
+    if upscale_options.upscaler is not None and upscale_options.upscaler.name != "None":
+        original_image = result_image.copy()
+        logger.info(
+            "Upscale with %s scale = %s",
+            upscale_options.upscaler.name,
+            upscale_options.scale,
+        )
+        result_image = upscale_options.upscaler.scaler.upscale(
+            image, upscale_options.scale, upscale_options.upscaler.data_path
+        )
+        if upscale_options.scale == 1:
+            result_image = Image.blend(
+                original_image, result_image, upscale_options.upscale_visibility
+            )
+
+    if upscale_options.face_restorer is not None:
+        original_image = result_image.copy()
+        logger.info("Restore face with %s", upscale_options.face_restorer.name())
+        numpy_image = np.array(result_image)
+        numpy_image = upscale_options.face_restorer.restore(numpy_image)
+        restored_image = Image.fromarray(numpy_image)
+        result_image = Image.blend(
+            original_image, restored_image, upscale_options.restorer_visibility
+        )
+
+    return result_image
+
+
+
+    # Check if the source face is in cache
+    if face_index == 0 and np.array_equal(img_data, SOURCE_IMG_DATA): 
+        return SOURCE_FACE_CACHE
+
+    # If not, extract the face and cache it
+    face_analyser = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
+    face_analyser.prepare(ctx_id=0, det_size=det_size)
+    face = face_analyser.get(img_data)
+
+    if len(face) == 0 and det_size[0] > 320 and det_size[1] > 320:
+        det_size_half = (det_size[0] // 2, det_size[1] // 2)
+        return get_face_single(img_data, face_index=face_index, det_size=det_size_half)
+
+    try:
+        result_face = sorted(face, key=lambda x: x.bbox[0])[face_index]
+        # Cache the source face information if it's the source face
+        if face_index == 0:
+            SOURCE_FACE_CACHE = result_face
+            SOURCE_IMG_DATA = img_data
+        return result_face
+    except IndexError:
+        return None
+
+
+
+@dataclass
+class ImageResult:
+    path: Union[str, None] = None
+    similarity: Union[Dict[int, float], None] = None  # face, 0..1
+
+    def image(self) -> Union[Image.Image, None]:
+        if self.path:
+            return Image.open(self.path)
+        return None
+
+
+def swap_face(
+    source_img: Image.Image,
+    target_img: Image.Image,
+    model: Union[str, None] = None,
+    faces_index: Set[int] = {0},
+    upscale_options: Union[UpscaleOptions, None] = None,
+) -> ImageResult:
+    result_image = target_img
+    converted = convert_to_sd(target_img)
+    scale, fn = converted[0], converted[1]
+    if model is not None and not scale:
+        if isinstance(source_img, str):  # source_img is a base64 string
+            import base64, io
+            if 'base64,' in source_img:  # check if the base64 string has a data URL scheme
+                base64_data = source_img.split('base64,')[-1]
+                img_bytes = base64.b64decode(base64_data)
+            else:
+                # if no data URL scheme, just decode
+                img_bytes = base64.b64decode(source_img)
+            source_img = Image.open(io.BytesIO(img_bytes))
+        source_img = cv2.cvtColor(np.array(source_img), cv2.COLOR_RGB2BGR)
+        target_img = cv2.cvtColor(np.array(target_img), cv2.COLOR_RGB2BGR)
+        source_face = get_face_single(source_img, face_index=0)
+        if source_face is not None:
+            result = target_img
+            model_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), model)
+            face_swapper = getFaceSwapModel(model_path)
+
+            for face_num in faces_index:
+                target_face = get_face_single(target_img, face_index=face_num)
+                if target_face is not None:
+                    result = face_swapper.get(result, target_face, source_face)
+                else:
+                    logger.info(f"No target face found for {face_num}")
+
+            result_image = Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+            if upscale_options is not None:
+                result_image = upscale_image(result_image, upscale_options)
+        else:
+            logger.info("No source face found")
+    result_image.save(fn.name)
+    return ImageResult(path=fn.name)
+
+import multiprocessing
+
+def parallel_face_swap(source_img, target_images_list, model=None, faces_index={0}, upscale_options=None):
+    # Wrapper function for swap_face to be used with multiprocessing
+    def worker(target_img):
+        return swap_face(source_img, target_img, model, faces_index, upscale_options)
+    
+    # Using Pool to parallelize the face swapping process
+    with multiprocessing.Pool(multiprocessing.cpu_count()) as pool:
+        results = pool.map(worker, target_images_list)
+    
+    return results
