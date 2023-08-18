@@ -17,6 +17,9 @@ from modules.face_restoration import FaceRestoration, restore_faces
 from modules.upscaler import Upscaler, UpscalerData
 from scripts.roop_logging import logger
 
+
+# Global cache for source face information
+SOURCE_FACE_CACHE = {}
 providers = ["CPUExecutionProvider"]
 
 
@@ -30,6 +33,20 @@ class UpscaleOptions:
 
 FS_MODEL = None
 CURRENT_FS_MODEL_PATH = None
+
+def get_face_single(img_data: np.ndarray, face_index=0, det_size=(640, 640)):
+    face_analyser = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
+    face_analyser.prepare(ctx_id=0, det_size=det_size)
+    face = face_analyser.get(img_data)
+
+    if len(face) == 0 and det_size[0] > 320 and det_size[1] > 320:
+        det_size_half = (det_size[0] // 2, det_size[1] // 2)
+        return get_face_single(img_data, face_index=face_index, det_size=det_size_half)
+
+    try:
+        return sorted(face, key=lambda x: x.bbox[0])[face_index]
+    except IndexError:
+        return None
 
 
 def getFaceSwapModel(model_path: str):
@@ -72,7 +89,12 @@ def upscale_image(image: Image, upscale_options: UpscaleOptions):
     return result_image
 
 
-def get_face_single(img_data: np.ndarray, face_index=0, det_size=(640, 640)):
+
+    # Check if the source face is in cache
+    if face_index == 0 and np.array_equal(img_data, SOURCE_IMG_DATA): 
+        return SOURCE_FACE_CACHE
+
+    # If not, extract the face and cache it
     face_analyser = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
     face_analyser.prepare(ctx_id=0, det_size=det_size)
     face = face_analyser.get(img_data)
@@ -82,9 +104,15 @@ def get_face_single(img_data: np.ndarray, face_index=0, det_size=(640, 640)):
         return get_face_single(img_data, face_index=face_index, det_size=det_size_half)
 
     try:
-        return sorted(face, key=lambda x: x.bbox[0])[face_index]
+        result_face = sorted(face, key=lambda x: x.bbox[0])[face_index]
+        # Cache the source face information if it's the source face
+        if face_index == 0:
+            SOURCE_FACE_CACHE = result_face
+            SOURCE_IMG_DATA = img_data
+        return result_face
     except IndexError:
         return None
+
 
 
 @dataclass
@@ -140,3 +168,18 @@ def swap_face(
             logger.info("No source face found")
     result_image.save(fn.name)
     return ImageResult(path=fn.name)
+
+
+
+import multiprocessing
+
+def parallel_face_swap(source_img, target_images_list, model=None, faces_index={0}, upscale_options=None):
+    # Wrapper function for swap_face to be used with multiprocessing
+    def worker(target_img):
+        return swap_face(source_img, target_img, model, faces_index, upscale_options)
+    
+    # Using Pool to parallelize the face swapping process
+    with multiprocessing.Pool(multiprocessing.cpu_count()) as pool:
+        results = pool.map(worker, target_images_list)
+    
+    return resultsy
